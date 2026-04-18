@@ -4,6 +4,7 @@ using BepInEx.Logging;
 using crecheng.DSPModSave;
 using HarmonyLib;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
@@ -11,7 +12,7 @@ using UnityEngine;
 
 namespace AssemblerVerticalConstruction
 {
-    [BepInPlugin("lltcggie.DSP.plugin.AssemblerVerticalConstruction", "AssemblerVerticalConstruction", "1.1.9")]
+    [BepInPlugin("lltcggie.DSP.plugin.AssemblerVerticalConstruction", "AssemblerVerticalConstruction", "1.2.0")]
     [BepInDependency(DSPModSavePlugin.MODGUID)]
     [ModSaveSettings(LoadOrder = LoadOrder.Postload)]
     public class AssemblerVerticalConstruction : BaseUnityPlugin, IModCanSave
@@ -39,7 +40,9 @@ namespace AssemblerVerticalConstruction
 
         public void Awake()
         {
-            Harmony.CreateAndPatchAll(Assembly.GetExecutingAssembly());
+            var harmony = new Harmony("lltcggie.DSP.plugin.AssemblerVerticalConstruction");
+            harmony.PatchAll(Assembly.GetExecutingAssembly());
+            NebulaCompat.TryPatchNebula(harmony);
 
             IsResetNextIds = Config.Bind("config", "IsResetNextIds", false, "true if building overlay relationships must be recalculated when loading save data. This value is always reset to false when the game is closed.");
         }
@@ -132,9 +135,203 @@ namespace AssemblerVerticalConstruction
         }
     }
 
+    internal static class NebulaCompat
+    {
+        private static bool _isNebulaPatched;
+        private static PropertyInfo _nebulaIsActiveProperty;
+        private static readonly ConcurrentDictionary<Type, PacketPropertyCache> _packetPropertyCache = new ConcurrentDictionary<Type, PacketPropertyCache>();
+
+        public static void TryPatchNebula(Harmony harmony)
+        {
+            if (_isNebulaPatched || harmony == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var processorType = AccessTools.TypeByName("NebulaNetwork.PacketProcessors.Factory.Assembler.AssemblerRecipeEventProcessor");
+                if (processorType == null)
+                {
+                    return;
+                }
+
+                var processPacketMethod = AccessTools.Method(processorType, "ProcessPacket");
+                var postfixMethod = AccessTools.Method(typeof(NebulaCompat), nameof(ProcessAssemblerRecipePacketPostfix));
+                if (processPacketMethod == null || postfixMethod == null)
+                {
+                    var nebulaAssemblyVersion = GetAssemblyVersionOrUnknown(processorType);
+                    AssemblerVerticalConstruction.Logger.LogWarning(
+                        $"Nebula compatibility patch could not be enabled for processor type '{processorType.FullName}' (assembly version {nebulaAssemblyVersion}). " +
+                        $"Resolved methods: ProcessPacket={(processPacketMethod != null ? "found" : "missing")}, " +
+                        $"{nameof(ProcessAssemblerRecipePacketPostfix)}={(postfixMethod != null ? "found" : "missing")}.");
+                    return;
+                }
+
+                harmony.Patch(processPacketMethod, postfix: new HarmonyMethod(postfixMethod));
+                _isNebulaPatched = true;
+
+                var multiplayerType = AccessTools.TypeByName("NebulaWorld.Multiplayer");
+                _nebulaIsActiveProperty = AccessTools.Property(multiplayerType, "IsActive");
+                var nebulaIsActiveGetter = _nebulaIsActiveProperty?.GetGetMethod();
+                if (nebulaIsActiveGetter != null && nebulaIsActiveGetter.IsStatic)
+                {
+                    AssemblerVerticalConstruction.Logger.LogInfo("Nebula compatibility patch enabled.");
+                }
+                else
+                {
+                    _nebulaIsActiveProperty = null;
+                    AssemblerVerticalConstruction.Logger.LogWarning("Nebula IsActive property is unavailable or non-static. Falling back to unconditional packet sync behavior.");
+                }
+            }
+            catch (Exception ex)
+            {
+                AssemblerVerticalConstruction.Logger.LogWarning($"Failed to apply Nebula compatibility patch: {ex}");
+            }
+        }
+
+        // __0 is Harmony's positional binding for the first ProcessPacket argument (Nebula packet instance).
+        public static void ProcessAssemblerRecipePacketPostfix(object __0)
+        {
+            if (!ShouldRunNebulaPacketSync() || __0 == null)
+            {
+                return;
+            }
+
+            try
+            {
+                PacketPropertyCache propertyCache = GetPacketPropertyCache(__0.GetType());
+                if (!propertyCache.IsValid)
+                {
+                    return;
+                }
+
+                int planetId = GetIntPropertyValue(__0, propertyCache.PlanetIdProperty);
+                int assemblerId = GetIntPropertyValue(__0, propertyCache.AssemblerIndexProperty);
+                int recipeId = GetIntPropertyValue(__0, propertyCache.RecipeIdProperty);
+
+                if (planetId <= 0 || assemblerId <= 0)
+                {
+                    return;
+                }
+
+                var planet = GameMain.galaxy?.PlanetById(planetId);
+                var factorySystem = planet?.factory?.factorySystem;
+                if (factorySystem == null || assemblerId >= factorySystem.assemblerPool.Length || factorySystem.assemblerPool[assemblerId].id != assemblerId)
+                {
+                    return;
+                }
+
+                if (recipeId == -1)
+                {
+                    AssemblerPatches.SyncForceAccMode(factorySystem, assemblerId);
+                }
+                else
+                {
+                    AssemblerPatches.SyncAssemblerFunctionsMultiplayerSafe(factorySystem, assemblerId);
+                }
+            }
+            catch (Exception ex)
+            {
+                AssemblerVerticalConstruction.Logger.LogWarning($"Nebula compatibility sync failed: {ex}");
+            }
+        }
+
+        private static bool ShouldRunNebulaPacketSync()
+        {
+            if (_nebulaIsActiveProperty == null)
+            {
+                return true;
+            }
+
+            try
+            {
+                return _nebulaIsActiveProperty.GetValue(null, null) is bool isActive && isActive;
+            }
+            catch (Exception ex)
+            {
+                AssemblerVerticalConstruction.Logger.LogWarning($"Failed to query Nebula multiplayer state: {ex}");
+                return true;
+            }
+        }
+
+        private static PacketPropertyCache GetPacketPropertyCache(Type packetType)
+        {
+            return _packetPropertyCache.GetOrAdd(packetType, type =>
+            {
+                var planetIdProperty = AccessTools.Property(type, "PlanetId");
+                var assemblerIndexProperty = AccessTools.Property(type, "AssemblerIndex");
+                var recipeIdProperty = AccessTools.Property(type, "RecipeId");
+                var cache = new PacketPropertyCache(planetIdProperty, assemblerIndexProperty, recipeIdProperty);
+                if (!cache.IsValid)
+                {
+                    AssemblerVerticalConstruction.Logger.LogWarning(
+                        $"Nebula packet type '{type.FullName}' is missing expected properties: PlanetId={(planetIdProperty != null ? "found" : "missing")}, AssemblerIndex={(assemblerIndexProperty != null ? "found" : "missing")}, RecipeId={(recipeIdProperty != null ? "found" : "missing")}.");
+                }
+                return cache;
+            });
+        }
+
+        private static int GetIntPropertyValue(object instance, PropertyInfo property)
+        {
+            if (property == null)
+            {
+                return 0;
+            }
+            var value = property.GetValue(instance, null);
+            return (value is int intValue) ? intValue : 0;
+        }
+
+        private static string GetAssemblyVersionOrUnknown(Type type)
+        {
+            if (type == null || type.Assembly == null)
+            {
+                return "unknown";
+            }
+
+            try
+            {
+                return type.Assembly.GetName()?.Version?.ToString() ?? "unknown";
+            }
+            catch
+            {
+                return "unknown";
+            }
+        }
+
+        private class PacketPropertyCache
+        {
+            public readonly PropertyInfo PlanetIdProperty;
+            public readonly PropertyInfo AssemblerIndexProperty;
+            public readonly PropertyInfo RecipeIdProperty;
+            private readonly bool _isValid;
+
+            public bool IsValid => _isValid;
+
+            public PacketPropertyCache(PropertyInfo planetIdProperty, PropertyInfo assemblerIndexProperty, PropertyInfo recipeIdProperty)
+            {
+                PlanetIdProperty = planetIdProperty;
+                AssemblerIndexProperty = assemblerIndexProperty;
+                RecipeIdProperty = recipeIdProperty;
+                _isValid = PlanetIdProperty != null && AssemblerIndexProperty != null && RecipeIdProperty != null;
+            }
+        }
+    }
+
     [HarmonyPatch]
     internal class AssemblerPatches
     {
+        private static readonly FieldInfo VerticalConstructionLevelField = AccessTools.Field(typeof(GameHistoryData), "verticalConstructionLevel");
+        private static bool _verticalResearchReflectionFailureLogged;
+
+        static AssemblerPatches()
+        {
+            if (VerticalConstructionLevelField == null)
+            {
+                AssemblerVerticalConstruction.Logger.LogInfo("GameHistoryData.verticalConstructionLevel was not found. Using storageLevel fallback for vertical construction research checks.");
+            }
+        }
+
         class ModelSetting
         {
             public bool multiLevelAllowPortsOrSlots;
@@ -479,6 +676,16 @@ namespace AssemblerVerticalConstruction
 
         public static void SyncAssemblerFunctions(FactorySystem factorySystem, Player player, int assemblerId)
         {
+            SyncAssemblerFunctionsInternal(factorySystem, player, assemblerId, true);
+        }
+
+        public static void SyncAssemblerFunctionsMultiplayerSafe(FactorySystem factorySystem, int assemblerId)
+        {
+            SyncAssemblerFunctionsInternal(factorySystem, null, assemblerId, false);
+        }
+
+        private static void SyncAssemblerFunctionsInternal(FactorySystem factorySystem, Player player, int assemblerId, bool takeBackItems)
+        {
             var _this = factorySystem;
             int entityId = _this.assemblerPool[assemblerId].entityId;
             if (entityId == 0)
@@ -503,13 +710,19 @@ namespace AssemblerVerticalConstruction
                         {
                             if (_this.assemblerPool[assemblerId2].recipeId != _this.assemblerPool[assemblerId].recipeId)
                             {
-                                _this.TakeBackItems_Assembler(player, assemblerId2);
+                                if (takeBackItems && player != null)
+                                {
+                                    _this.TakeBackItems_Assembler(player, assemblerId2);
+                                }
                                 _this.assemblerPool[assemblerId2].SetRecipe(_this.assemblerPool[assemblerId].recipeId, _this.factory.entitySignPool);
                             }
                         }
                         else if (_this.assemblerPool[assemblerId2].recipeId != 0)
                         {
-                            _this.TakeBackItems_Assembler(player, assemblerId2);
+                            if (takeBackItems && player != null)
+                            {
+                                _this.TakeBackItems_Assembler(player, assemblerId2);
+                            }
                             _this.assemblerPool[assemblerId2].SetRecipe(0, _this.factory.entitySignPool);
                         }
                     }
@@ -534,13 +747,19 @@ namespace AssemblerVerticalConstruction
                         {
                             if (_this.assemblerPool[assemblerId3].recipeId != _this.assemblerPool[assemblerId].recipeId)
                             {
-                                _this.TakeBackItems_Assembler(_this.factory.gameData.mainPlayer, assemblerId3);
+                                if (takeBackItems && _this.factory.gameData.mainPlayer != null)
+                                {
+                                    _this.TakeBackItems_Assembler(_this.factory.gameData.mainPlayer, assemblerId3);
+                                }
                                 _this.assemblerPool[assemblerId3].SetRecipe(_this.assemblerPool[assemblerId].recipeId, _this.factory.entitySignPool);
                             }
                         }
                         else if (_this.assemblerPool[assemblerId3].recipeId != 0)
                         {
-                            _this.TakeBackItems_Assembler(_this.factory.gameData.mainPlayer, assemblerId3);
+                            if (takeBackItems && _this.factory.gameData.mainPlayer != null)
+                            {
+                                _this.TakeBackItems_Assembler(_this.factory.gameData.mainPlayer, assemblerId3);
+                            }
                             _this.assemblerPool[assemblerId3].SetRecipe(0, _this.factory.entitySignPool);
                         }
                     }
@@ -702,10 +921,10 @@ namespace AssemblerVerticalConstruction
                     ModelSetting setting;
                     if (ModelSettingDict.TryGetValue(id, out setting))
                     {
-                        var storageResearchLevel = history.storageLevel - 2;
-                        if (storageResearchLevel < setting.multiLevelMaxBuildCount.Length) // 为防万一，如果垂直建设研究的最大等级超过本MOD开发时设定的最大等级6，则不执行任何操作
+                        var verticalResearchLevel = GetVerticalConstructionResearchLevel(history);
+                        if (verticalResearchLevel < setting.multiLevelMaxBuildCount.Length) // 为防万一，如果垂直建设研究的最大等级超过本MOD开发时设定的最大等级6，则不执行任何操作
                         {
-                            int level = setting.multiLevelMaxBuildCount[storageResearchLevel];
+                            int level = setting.multiLevelMaxBuildCount[verticalResearchLevel];
                             int maxCount = setting.multiLevelMaxBuildCount[6];
 
                             int verticalCount = 0;
@@ -752,6 +971,37 @@ namespace AssemblerVerticalConstruction
                     break;
                 }
             }
+        }
+
+        private static int GetVerticalConstructionResearchLevel(GameHistoryData history)
+        {
+            if (history == null)
+            {
+                return 0;
+            }
+
+            if (VerticalConstructionLevelField != null)
+            {
+                try
+                {
+                    var value = VerticalConstructionLevelField.GetValue(history);
+                    if (value is int verticalLevel && verticalLevel >= 0)
+                    {
+                        return verticalLevel;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (!_verticalResearchReflectionFailureLogged)
+                    {
+                        _verticalResearchReflectionFailureLogged = true;
+                        AssemblerVerticalConstruction.Logger.LogWarning($"Failed to read GameHistoryData.verticalConstructionLevel via reflection. Falling back to storageLevel. {ex.Message}");
+                    }
+                }
+            }
+
+            int storageResearchLevel = history.storageLevel - 2;
+            return Math.Max(0, storageResearchLevel);
         }
     }
 }

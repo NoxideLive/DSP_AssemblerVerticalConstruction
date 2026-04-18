@@ -8,6 +8,10 @@ Originally released by FYJ95 [here](https://dsp.thunderstore.io/package/57a103a4
 
 ## 更新日志
 
+### v1.2.0
+- 增加与 Nebula 多人联机的兼容处理：在联机配方同步事件后，同步整列堆叠装配器的配方与增产/加速模式
+- 垂直建造研究等级读取增加对新字段的兼容回退，提升对新版 DSP 的适配性
+
 ### v1.1.9
 - 兼容 ProjectGenesis（创世之书）mod，支持等离子熔炉进行垂直建造
 
@@ -31,6 +35,10 @@ Originally released by FYJ95 [here](https://dsp.thunderstore.io/package/57a103a4
 Allows assemblers, smelters, chemical plants, and other production buildings to be constructed vertically, similar to Matrix Labs.
 
 ## Changelog
+
+### v1.2.0
+- Added Nebula multiplayer compatibility handling: after multiplayer assembler recipe events, synchronize recipe and forceAccMode across the whole stacked chain
+- Added resilient vertical-construction research-level lookup with fallback logic for newer DSP code
 
 ### v1.1.9
 - Added compatibility with the ProjectGenesis mod: Plasma Furnace now supports vertical construction
