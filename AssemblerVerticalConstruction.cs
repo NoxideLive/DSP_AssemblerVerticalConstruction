@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace AssemblerVerticalConstruction
 {
-    [BepInPlugin("lltcggie.DSP.plugin.AssemblerVerticalConstruction", "AssemblerVerticalConstruction", "1.1.9")]
+    [BepInPlugin("lltcggie.DSP.plugin.AssemblerVerticalConstruction", "AssemblerVerticalConstruction", "1.2.0")]
     [BepInDependency(DSPModSavePlugin.MODGUID)]
     [ModSaveSettings(LoadOrder = LoadOrder.Postload)]
     public class AssemblerVerticalConstruction : BaseUnityPlugin, IModCanSave
@@ -39,7 +39,9 @@ namespace AssemblerVerticalConstruction
 
         public void Awake()
         {
-            Harmony.CreateAndPatchAll(Assembly.GetExecutingAssembly());
+            var harmony = new Harmony("lltcggie.DSP.plugin.AssemblerVerticalConstruction");
+            harmony.PatchAll(Assembly.GetExecutingAssembly());
+            NebulaCompat.TryPatchNebula(harmony);
 
             IsResetNextIds = Config.Bind("config", "IsResetNextIds", false, "true if building overlay relationships must be recalculated when loading save data. This value is always reset to false when the game is closed.");
         }
@@ -129,6 +131,102 @@ namespace AssemblerVerticalConstruction
             Logger.LogInfo("ResetNextIds");
 
             AssemblerPatches.ResetNextIds();
+        }
+    }
+
+    internal static class NebulaCompat
+    {
+        private static bool _isNebulaPatched;
+        private static PropertyInfo _nebulaIsActiveProperty;
+
+        public static void TryPatchNebula(Harmony harmony)
+        {
+            if (_isNebulaPatched || harmony == null)
+            {
+                return;
+            }
+
+            try
+            {
+                var processorType = AccessTools.TypeByName("NebulaNetwork.PacketProcessors.Factory.Assembler.AssemblerRecipeEventProcessor");
+                var processPacketMethod = AccessTools.Method(processorType, "ProcessPacket");
+                var postfixMethod = AccessTools.Method(typeof(NebulaCompat), nameof(ProcessAssemblerRecipePacketPostfix));
+                if (processPacketMethod == null || postfixMethod == null)
+                {
+                    return;
+                }
+
+                harmony.Patch(processPacketMethod, postfix: new HarmonyMethod(postfixMethod));
+                _isNebulaPatched = true;
+
+                var multiplayerType = AccessTools.TypeByName("NebulaWorld.Multiplayer");
+                _nebulaIsActiveProperty = AccessTools.Property(multiplayerType, "IsActive");
+                AssemblerVerticalConstruction.Logger.LogInfo("Nebula compatibility patch enabled.");
+            }
+            catch (Exception ex)
+            {
+                AssemblerVerticalConstruction.Logger.LogWarning($"Failed to apply Nebula compatibility patch: {ex}");
+            }
+        }
+
+        public static void ProcessAssemblerRecipePacketPostfix(object packet)
+        {
+            if (!IsNebulaMultiplayerActive() || packet == null)
+            {
+                return;
+            }
+
+            try
+            {
+                int planetId = GetIntPropertyValue(packet, "PlanetId");
+                int assemblerId = GetIntPropertyValue(packet, "AssemblerIndex");
+                int recipeId = GetIntPropertyValue(packet, "RecipeId");
+
+                if (planetId <= 0 || assemblerId <= 0)
+                {
+                    return;
+                }
+
+                var planet = GameMain.galaxy?.PlanetById(planetId);
+                var factorySystem = planet?.factory?.factorySystem;
+                if (factorySystem == null || assemblerId >= factorySystem.assemblerPool.Length || factorySystem.assemblerPool[assemblerId].id != assemblerId)
+                {
+                    return;
+                }
+
+                if (recipeId == -1)
+                {
+                    AssemblerPatches.SyncForceAccMode(factorySystem, assemblerId);
+                }
+                else
+                {
+                    AssemblerPatches.SyncAssemblerFunctions(factorySystem, factorySystem.factory.gameData.mainPlayer, assemblerId);
+                }
+            }
+            catch (Exception ex)
+            {
+                AssemblerVerticalConstruction.Logger.LogWarning($"Nebula compatibility sync failed: {ex}");
+            }
+        }
+
+        private static bool IsNebulaMultiplayerActive()
+        {
+            if (_nebulaIsActiveProperty == null)
+            {
+                return false;
+            }
+            return _nebulaIsActiveProperty.GetValue(null, null) is bool isActive && isActive;
+        }
+
+        private static int GetIntPropertyValue(object instance, string propertyName)
+        {
+            var property = AccessTools.Property(instance.GetType(), propertyName);
+            if (property == null)
+            {
+                return 0;
+            }
+            var value = property.GetValue(instance, null);
+            return (value is int intValue) ? intValue : 0;
         }
     }
 
@@ -702,10 +800,10 @@ namespace AssemblerVerticalConstruction
                     ModelSetting setting;
                     if (ModelSettingDict.TryGetValue(id, out setting))
                     {
-                        var storageResearchLevel = history.storageLevel - 2;
-                        if (storageResearchLevel < setting.multiLevelMaxBuildCount.Length) // 为防万一，如果垂直建设研究的最大等级超过本MOD开发时设定的最大等级6，则不执行任何操作
+                        var verticalResearchLevel = GetVerticalConstructionResearchLevel(history);
+                        if (verticalResearchLevel < setting.multiLevelMaxBuildCount.Length) // 为防万一，如果垂直建设研究的最大等级超过本MOD开发时设定的最大等级6，则不执行任何操作
                         {
-                            int level = setting.multiLevelMaxBuildCount[storageResearchLevel];
+                            int level = setting.multiLevelMaxBuildCount[verticalResearchLevel];
                             int maxCount = setting.multiLevelMaxBuildCount[6];
 
                             int verticalCount = 0;
@@ -752,6 +850,27 @@ namespace AssemblerVerticalConstruction
                     break;
                 }
             }
+        }
+
+        private static int GetVerticalConstructionResearchLevel(GameHistoryData history)
+        {
+            if (history == null)
+            {
+                return 0;
+            }
+
+            var verticalResearchField = AccessTools.Field(typeof(GameHistoryData), "verticalConstructionLevel");
+            if (verticalResearchField != null)
+            {
+                var value = verticalResearchField.GetValue(history);
+                if (value is int verticalLevel && verticalLevel >= 0)
+                {
+                    return verticalLevel;
+                }
+            }
+
+            int storageResearchLevel = history.storageLevel - 2;
+            return Math.Max(0, storageResearchLevel);
         }
     }
 }
