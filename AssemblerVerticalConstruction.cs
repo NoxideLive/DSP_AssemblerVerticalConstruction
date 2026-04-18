@@ -4,6 +4,7 @@ using BepInEx.Logging;
 using crecheng.DSPModSave;
 using HarmonyLib;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
@@ -138,6 +139,7 @@ namespace AssemblerVerticalConstruction
     {
         private static bool _isNebulaPatched;
         private static PropertyInfo _nebulaIsActiveProperty;
+        private static readonly ConcurrentDictionary<Type, PacketPropertyCache> _packetPropertyCache = new ConcurrentDictionary<Type, PacketPropertyCache>();
 
         public static void TryPatchNebula(Harmony harmony)
         {
@@ -149,10 +151,20 @@ namespace AssemblerVerticalConstruction
             try
             {
                 var processorType = AccessTools.TypeByName("NebulaNetwork.PacketProcessors.Factory.Assembler.AssemblerRecipeEventProcessor");
+                if (processorType == null)
+                {
+                    return;
+                }
+
                 var processPacketMethod = AccessTools.Method(processorType, "ProcessPacket");
                 var postfixMethod = AccessTools.Method(typeof(NebulaCompat), nameof(ProcessAssemblerRecipePacketPostfix));
                 if (processPacketMethod == null || postfixMethod == null)
                 {
+                    var nebulaAssemblyVersion = GetAssemblyVersionOrUnknown(processorType);
+                    AssemblerVerticalConstruction.Logger.LogWarning(
+                        $"Nebula compatibility patch could not be enabled for processor type '{processorType.FullName}' (assembly version {nebulaAssemblyVersion}). " +
+                        $"Resolved methods: ProcessPacket={(processPacketMethod != null ? "found" : "missing")}, " +
+                        $"{nameof(ProcessAssemblerRecipePacketPostfix)}={(postfixMethod != null ? "found" : "missing")}.");
                     return;
                 }
 
@@ -188,9 +200,15 @@ namespace AssemblerVerticalConstruction
 
             try
             {
-                int planetId = GetIntPropertyValue(__0, "PlanetId");
-                int assemblerId = GetIntPropertyValue(__0, "AssemblerIndex");
-                int recipeId = GetIntPropertyValue(__0, "RecipeId");
+                PacketPropertyCache propertyCache = GetPacketPropertyCache(__0.GetType());
+                if (!propertyCache.IsValid)
+                {
+                    return;
+                }
+
+                int planetId = GetIntPropertyValue(__0, propertyCache.PlanetIdProperty);
+                int assemblerId = GetIntPropertyValue(__0, propertyCache.AssemblerIndexProperty);
+                int recipeId = GetIntPropertyValue(__0, propertyCache.RecipeIdProperty);
 
                 if (planetId <= 0 || assemblerId <= 0)
                 {
@@ -237,9 +255,25 @@ namespace AssemblerVerticalConstruction
             }
         }
 
-        private static int GetIntPropertyValue(object instance, string propertyName)
+        private static PacketPropertyCache GetPacketPropertyCache(Type packetType)
         {
-            var property = AccessTools.Property(instance.GetType(), propertyName);
+            return _packetPropertyCache.GetOrAdd(packetType, type =>
+            {
+                var planetIdProperty = AccessTools.Property(type, "PlanetId");
+                var assemblerIndexProperty = AccessTools.Property(type, "AssemblerIndex");
+                var recipeIdProperty = AccessTools.Property(type, "RecipeId");
+                var cache = new PacketPropertyCache(planetIdProperty, assemblerIndexProperty, recipeIdProperty);
+                if (!cache.IsValid)
+                {
+                    AssemblerVerticalConstruction.Logger.LogWarning(
+                        $"Nebula packet type '{type.FullName}' is missing expected properties: PlanetId={(planetIdProperty != null ? "found" : "missing")}, AssemblerIndex={(assemblerIndexProperty != null ? "found" : "missing")}, RecipeId={(recipeIdProperty != null ? "found" : "missing")}.");
+                }
+                return cache;
+            });
+        }
+
+        private static int GetIntPropertyValue(object instance, PropertyInfo property)
+        {
             if (property == null)
             {
                 return 0;
@@ -247,12 +281,48 @@ namespace AssemblerVerticalConstruction
             var value = property.GetValue(instance, null);
             return (value is int intValue) ? intValue : 0;
         }
+
+        private static string GetAssemblyVersionOrUnknown(Type type)
+        {
+            if (type == null || type.Assembly == null)
+            {
+                return "unknown";
+            }
+
+            try
+            {
+                return type.Assembly.GetName()?.Version?.ToString() ?? "unknown";
+            }
+            catch
+            {
+                return "unknown";
+            }
+        }
+
+        private class PacketPropertyCache
+        {
+            public readonly PropertyInfo PlanetIdProperty;
+            public readonly PropertyInfo AssemblerIndexProperty;
+            public readonly PropertyInfo RecipeIdProperty;
+            private readonly bool _isValid;
+
+            public bool IsValid => _isValid;
+
+            public PacketPropertyCache(PropertyInfo planetIdProperty, PropertyInfo assemblerIndexProperty, PropertyInfo recipeIdProperty)
+            {
+                PlanetIdProperty = planetIdProperty;
+                AssemblerIndexProperty = assemblerIndexProperty;
+                RecipeIdProperty = recipeIdProperty;
+                _isValid = PlanetIdProperty != null && AssemblerIndexProperty != null && RecipeIdProperty != null;
+            }
+        }
     }
 
     [HarmonyPatch]
     internal class AssemblerPatches
     {
         private static readonly FieldInfo VerticalConstructionLevelField = AccessTools.Field(typeof(GameHistoryData), "verticalConstructionLevel");
+        private static bool _verticalResearchReflectionFailureLogged;
 
         static AssemblerPatches()
         {
@@ -912,10 +982,21 @@ namespace AssemblerVerticalConstruction
 
             if (VerticalConstructionLevelField != null)
             {
-                var value = VerticalConstructionLevelField.GetValue(history);
-                if (value is int verticalLevel && verticalLevel >= 0)
+                try
                 {
-                    return verticalLevel;
+                    var value = VerticalConstructionLevelField.GetValue(history);
+                    if (value is int verticalLevel && verticalLevel >= 0)
+                    {
+                        return verticalLevel;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (!_verticalResearchReflectionFailureLogged)
+                    {
+                        _verticalResearchReflectionFailureLogged = true;
+                        AssemblerVerticalConstruction.Logger.LogWarning($"Failed to read GameHistoryData.verticalConstructionLevel via reflection. Falling back to storageLevel. {ex.Message}");
+                    }
                 }
             }
 
