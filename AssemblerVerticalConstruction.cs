@@ -161,7 +161,16 @@ namespace AssemblerVerticalConstruction
 
                 var multiplayerType = AccessTools.TypeByName("NebulaWorld.Multiplayer");
                 _nebulaIsActiveProperty = AccessTools.Property(multiplayerType, "IsActive");
-                AssemblerVerticalConstruction.Logger.LogInfo("Nebula compatibility patch enabled.");
+                var nebulaIsActiveGetter = _nebulaIsActiveProperty?.GetGetMethod();
+                if (nebulaIsActiveGetter != null && nebulaIsActiveGetter.IsStatic)
+                {
+                    AssemblerVerticalConstruction.Logger.LogInfo("Nebula compatibility patch enabled.");
+                }
+                else
+                {
+                    _nebulaIsActiveProperty = null;
+                    AssemblerVerticalConstruction.Logger.LogWarning("Nebula IsActive property is unavailable or non-static. Falling back to unconditional packet sync behavior.");
+                }
             }
             catch (Exception ex)
             {
@@ -169,18 +178,19 @@ namespace AssemblerVerticalConstruction
             }
         }
 
-        public static void ProcessAssemblerRecipePacketPostfix(object packet)
+        // __0 is Harmony's positional binding for the first ProcessPacket argument (Nebula packet instance).
+        public static void ProcessAssemblerRecipePacketPostfix(object __0)
         {
-            if (!IsNebulaMultiplayerActive() || packet == null)
+            if (!ShouldRunNebulaPacketSync() || __0 == null)
             {
                 return;
             }
 
             try
             {
-                int planetId = GetIntPropertyValue(packet, "PlanetId");
-                int assemblerId = GetIntPropertyValue(packet, "AssemblerIndex");
-                int recipeId = GetIntPropertyValue(packet, "RecipeId");
+                int planetId = GetIntPropertyValue(__0, "PlanetId");
+                int assemblerId = GetIntPropertyValue(__0, "AssemblerIndex");
+                int recipeId = GetIntPropertyValue(__0, "RecipeId");
 
                 if (planetId <= 0 || assemblerId <= 0)
                 {
@@ -200,7 +210,7 @@ namespace AssemblerVerticalConstruction
                 }
                 else
                 {
-                    AssemblerPatches.SyncAssemblerFunctions(factorySystem, factorySystem.factory.gameData.mainPlayer, assemblerId);
+                    AssemblerPatches.SyncAssemblerFunctionsMultiplayerSafe(factorySystem, assemblerId);
                 }
             }
             catch (Exception ex)
@@ -209,13 +219,22 @@ namespace AssemblerVerticalConstruction
             }
         }
 
-        private static bool IsNebulaMultiplayerActive()
+        private static bool ShouldRunNebulaPacketSync()
         {
             if (_nebulaIsActiveProperty == null)
             {
-                return false;
+                return true;
             }
-            return _nebulaIsActiveProperty.GetValue(null, null) is bool isActive && isActive;
+
+            try
+            {
+                return _nebulaIsActiveProperty.GetValue(null, null) is bool isActive && isActive;
+            }
+            catch (Exception ex)
+            {
+                AssemblerVerticalConstruction.Logger.LogWarning($"Failed to query Nebula multiplayer state: {ex}");
+                return true;
+            }
         }
 
         private static int GetIntPropertyValue(object instance, string propertyName)
@@ -233,6 +252,16 @@ namespace AssemblerVerticalConstruction
     [HarmonyPatch]
     internal class AssemblerPatches
     {
+        private static readonly FieldInfo VerticalConstructionLevelField = AccessTools.Field(typeof(GameHistoryData), "verticalConstructionLevel");
+
+        static AssemblerPatches()
+        {
+            if (VerticalConstructionLevelField == null)
+            {
+                AssemblerVerticalConstruction.Logger.LogInfo("GameHistoryData.verticalConstructionLevel was not found. Using storageLevel fallback for vertical construction research checks.");
+            }
+        }
+
         class ModelSetting
         {
             public bool multiLevelAllowPortsOrSlots;
@@ -577,6 +606,16 @@ namespace AssemblerVerticalConstruction
 
         public static void SyncAssemblerFunctions(FactorySystem factorySystem, Player player, int assemblerId)
         {
+            SyncAssemblerFunctionsInternal(factorySystem, player, assemblerId, true);
+        }
+
+        public static void SyncAssemblerFunctionsMultiplayerSafe(FactorySystem factorySystem, int assemblerId)
+        {
+            SyncAssemblerFunctionsInternal(factorySystem, null, assemblerId, false);
+        }
+
+        private static void SyncAssemblerFunctionsInternal(FactorySystem factorySystem, Player player, int assemblerId, bool takeBackItems)
+        {
             var _this = factorySystem;
             int entityId = _this.assemblerPool[assemblerId].entityId;
             if (entityId == 0)
@@ -601,13 +640,19 @@ namespace AssemblerVerticalConstruction
                         {
                             if (_this.assemblerPool[assemblerId2].recipeId != _this.assemblerPool[assemblerId].recipeId)
                             {
-                                _this.TakeBackItems_Assembler(player, assemblerId2);
+                                if (takeBackItems && player != null)
+                                {
+                                    _this.TakeBackItems_Assembler(player, assemblerId2);
+                                }
                                 _this.assemblerPool[assemblerId2].SetRecipe(_this.assemblerPool[assemblerId].recipeId, _this.factory.entitySignPool);
                             }
                         }
                         else if (_this.assemblerPool[assemblerId2].recipeId != 0)
                         {
-                            _this.TakeBackItems_Assembler(player, assemblerId2);
+                            if (takeBackItems && player != null)
+                            {
+                                _this.TakeBackItems_Assembler(player, assemblerId2);
+                            }
                             _this.assemblerPool[assemblerId2].SetRecipe(0, _this.factory.entitySignPool);
                         }
                     }
@@ -632,13 +677,19 @@ namespace AssemblerVerticalConstruction
                         {
                             if (_this.assemblerPool[assemblerId3].recipeId != _this.assemblerPool[assemblerId].recipeId)
                             {
-                                _this.TakeBackItems_Assembler(_this.factory.gameData.mainPlayer, assemblerId3);
+                                if (takeBackItems && _this.factory.gameData.mainPlayer != null)
+                                {
+                                    _this.TakeBackItems_Assembler(_this.factory.gameData.mainPlayer, assemblerId3);
+                                }
                                 _this.assemblerPool[assemblerId3].SetRecipe(_this.assemblerPool[assemblerId].recipeId, _this.factory.entitySignPool);
                             }
                         }
                         else if (_this.assemblerPool[assemblerId3].recipeId != 0)
                         {
-                            _this.TakeBackItems_Assembler(_this.factory.gameData.mainPlayer, assemblerId3);
+                            if (takeBackItems && _this.factory.gameData.mainPlayer != null)
+                            {
+                                _this.TakeBackItems_Assembler(_this.factory.gameData.mainPlayer, assemblerId3);
+                            }
                             _this.assemblerPool[assemblerId3].SetRecipe(0, _this.factory.entitySignPool);
                         }
                     }
@@ -859,10 +910,9 @@ namespace AssemblerVerticalConstruction
                 return 0;
             }
 
-            var verticalResearchField = AccessTools.Field(typeof(GameHistoryData), "verticalConstructionLevel");
-            if (verticalResearchField != null)
+            if (VerticalConstructionLevelField != null)
             {
-                var value = verticalResearchField.GetValue(history);
+                var value = VerticalConstructionLevelField.GetValue(history);
                 if (value is int verticalLevel && verticalLevel >= 0)
                 {
                     return verticalLevel;
